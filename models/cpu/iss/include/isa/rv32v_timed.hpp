@@ -3886,3 +3886,144 @@ static inline iss_reg_t vwaddu_vx_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
     }
     return iss_insn_next(iss, insn, pc);
 }
+
+enum vfixed_operand_kind { VFIXED_VV, VFIXED_VX, VFIXED_VI };
+
+static inline uint64_t vfixed_operand_get(Iss *iss, iss_insn_t *insn, vfixed_operand_kind kind, unsigned int elem,
+    unsigned int sewb, unsigned int lmul)
+{
+    switch (kind)
+    {
+        case VFIXED_VV: return velem_get_value(iss, REG_IN(0), elem, sewb, lmul);
+        case VFIXED_VX: return RVV_REG_GET(0);
+        default:        return SIM_GET(0);
+    }
+}
+
+static inline uint64_t vfixed_round_increment(Iss *iss, uint64_t v, unsigned int d)
+{
+    // Rounding increment for a right shift by d bits, following the roundoff rule of the RVV 1.0 spec
+    if (d == 0)
+        return 0;
+    uint64_t half  = (v >> (d - 1)) & 1;
+    uint64_t below = d > 1 && (v & ((1ULL << (d - 1)) - 1)) != 0;
+    uint64_t lsb   = (v >> d) & 1;
+    // vxrm modes are rnu, rne, rdn and rod
+    switch (iss->csr.vxrm.value & 3)
+    {
+        case 0:  return half;
+        case 1:  return half & (below | lsb);
+        case 2:  return 0;
+        default: return !lsb & (half | below);
+    }
+}
+
+static inline int64_t vfixed_roundoff_signed(Iss *iss, int64_t v, unsigned int d)
+{
+    return (v >> d) + (int64_t)vfixed_round_increment(iss, (uint64_t)v, d);
+}
+
+static inline uint64_t vfixed_roundoff_unsigned(Iss *iss, uint64_t v, unsigned int d)
+{
+    return (v >> d) + vfixed_round_increment(iss, v, d);
+}
+
+static inline int64_t vfixed_clip_signed(Iss *iss, int64_t v, unsigned int bits)
+{
+    int64_t max = (int64_t)((1ULL << (bits - 1)) - 1);
+    int64_t min = -max - 1;
+    if (v > max || v < min)
+    {
+        // Saturation sets vxsat, which stays set until software clears it
+        iss->csr.vxstat.value |= 1;
+        return v > max ? max : min;
+    }
+    return v;
+}
+
+static inline uint64_t vfixed_clip_unsigned(Iss *iss, uint64_t v, unsigned int bits)
+{
+    uint64_t max = (1ULL << bits) - 1;
+    if (v > max)
+    {
+        iss->csr.vxstat.value |= 1;
+        return max;
+    }
+    return v;
+}
+
+static inline iss_reg_t vsadd_body(Iss *iss, iss_insn_t *insn, iss_reg_t pc, vfixed_operand_kind kind)
+{
+    unsigned int sewb = iss->vector.sewb;
+    unsigned int lmul = iss->vector.lmul;
+    unsigned int bits = sewb * 8;
+    for (unsigned int i=VSTART; i<VEND; i++)
+    {
+        if (velem_is_active(iss, i, UIM_GET(0)))
+        {
+            int64_t a = get_signed_value(velem_get_value(iss, REG_IN(1), i, sewb, lmul), 64, bits);
+            int64_t b = get_signed_value(vfixed_operand_get(iss, insn, kind, i, sewb, lmul), 64, bits);
+            velem_set_value(iss, REG_OUT(0), i, sewb, vfixed_clip_signed(iss, a + b, bits));
+        }
+    }
+    return iss_insn_next(iss, insn, pc);
+}
+
+static inline iss_reg_t vsmul_body(Iss *iss, iss_insn_t *insn, iss_reg_t pc, vfixed_operand_kind kind)
+{
+    unsigned int sewb = iss->vector.sewb;
+    unsigned int lmul = iss->vector.lmul;
+    unsigned int bits = sewb * 8;
+    for (unsigned int i=VSTART; i<VEND; i++)
+    {
+        if (velem_is_active(iss, i, UIM_GET(0)))
+        {
+            int64_t a = get_signed_value(velem_get_value(iss, REG_IN(1), i, sewb, lmul), 64, bits);
+            int64_t b = get_signed_value(vfixed_operand_get(iss, insn, kind, i, sewb, lmul), 64, bits);
+            // Fractional multiply, the product is shifted right by sew-1 bits with rounding
+            int64_t product = a * b;
+            velem_set_value(iss, REG_OUT(0), i, sewb,
+                vfixed_clip_signed(iss, vfixed_roundoff_signed(iss, product, bits - 1), bits));
+        }
+    }
+    return iss_insn_next(iss, insn, pc);
+}
+
+static inline iss_reg_t vnclip_body(Iss *iss, iss_insn_t *insn, iss_reg_t pc, vfixed_operand_kind kind, bool is_signed)
+{
+    unsigned int sewb = iss->vector.sewb;
+    unsigned int lmul = iss->vector.lmul;
+    unsigned int bits = sewb * 8;
+    for (unsigned int i=VSTART; i<VEND; i++)
+    {
+        if (velem_is_active(iss, i, UIM_GET(0)))
+        {
+            // vs2 is 2*sew wide and only the low log2(2*sew) bits of the shift amount are used
+            uint64_t wide = velem_get_value(iss, REG_IN(1), i, 2 * sewb, lmul);
+            unsigned int shift = vfixed_operand_get(iss, insn, kind, i, sewb, lmul) & (2 * bits - 1);
+            uint64_t res;
+            if (is_signed)
+                res = vfixed_clip_signed(iss,
+                    vfixed_roundoff_signed(iss, get_signed_value(wide, 64, 2 * bits), shift), bits);
+            else
+                res = vfixed_clip_unsigned(iss, vfixed_roundoff_unsigned(iss, wide, shift), bits);
+            velem_set_value(iss, REG_OUT(0), i, sewb, res);
+        }
+    }
+    return iss_insn_next(iss, insn, pc);
+}
+
+static inline iss_reg_t vsadd_vv_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vsadd_body(iss, insn, pc, VFIXED_VV); }
+static inline iss_reg_t vsadd_vx_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vsadd_body(iss, insn, pc, VFIXED_VX); }
+static inline iss_reg_t vsadd_vi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vsadd_body(iss, insn, pc, VFIXED_VI); }
+
+static inline iss_reg_t vsmul_vv_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vsmul_body(iss, insn, pc, VFIXED_VV); }
+static inline iss_reg_t vsmul_vx_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vsmul_body(iss, insn, pc, VFIXED_VX); }
+
+static inline iss_reg_t vnclip_wv_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VV, true); }
+static inline iss_reg_t vnclip_wx_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VX, true); }
+static inline iss_reg_t vnclip_wi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VI, true); }
+
+static inline iss_reg_t vnclipu_wv_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VV, false); }
+static inline iss_reg_t vnclipu_wx_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VX, false); }
+static inline iss_reg_t vnclipu_wi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc) { return vnclip_body(iss, insn, pc, VFIXED_VI, false); }
